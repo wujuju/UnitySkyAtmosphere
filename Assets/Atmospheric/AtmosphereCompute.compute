@@ -1,0 +1,140 @@
+#pragma kernel IntergalTransmittanceLUT
+#pragma kernel NewMultiScattCS
+#pragma kernel IntergalSkyViewLutPS
+#pragma kernel IntergalCameraVolumeLUT
+
+#pragma multi_compile _ MULTISCATAPPROX_ENABLED
+#include "Resources/RenderSkyRayMarching.hlsl"
+
+RWTexture2D<float4> _TransmittanceLUT;
+RWTexture2D<float3> _SkyViewLUT;
+RWTexture3D<float4> _CameraVolumeLUT;
+
+[numthreads(8, 8, 1)]
+void IntergalTransmittanceLUT(uint3 id: SV_DispatchThreadID)
+{
+    float2 pixPos = id.xy + 0.5f;
+
+    AtmosphereParameters Atmosphere = GetAtmosphereParameters();
+
+    // Compute camera position from LUT coords
+    float2 uv = (pixPos) / float2(TRANSMITTANCE_TEXTURE_WIDTH, TRANSMITTANCE_TEXTURE_HEIGHT);
+    float viewHeight;
+    float viewZenithCosAngle;
+    UvToLutTransmittanceParams(Atmosphere, viewHeight, viewZenithCosAngle, uv);
+
+    //  A few extra needed constants
+    float3 WorldPos = float3(0.0f, viewHeight, 0.0f);
+    float3 WorldDir = float3(sqrt(1.0 - viewZenithCosAngle * viewZenithCosAngle), viewZenithCosAngle, 0.0f);
+
+    const bool ground = false;
+    const float SampleCountIni = 40.0f; // Can go a low as 10 sample but energy lost starts to be visible.
+    const float DepthBufferValue = -1.0;
+    const bool VariableSampleCount = false;
+    const bool MieRayPhase = false;
+    float3 transmittance = exp(-IntegrateScatteredLuminance(uv, WorldPos, WorldDir, sun_direction, Atmosphere,
+                                                            ground, SampleCountIni, DepthBufferValue,
+                                                            VariableSampleCount, MieRayPhase).OpticalDepth);
+
+    _TransmittanceLUT[id.xy] = float4(transmittance, 1.0f);
+}
+
+[numthreads(8, 8, 1)]
+void IntergalCameraVolumeLUT(uint3 id: SV_DispatchThreadID)
+{
+    float2 pixPos = id.xy + 0.5f;
+    float w, h, d;
+    _CameraVolumeLUT.GetDimensions(w, h, d);
+    AtmosphereParameters Atmosphere = GetAtmosphereParameters();
+    float2 uv = pixPos / float2(w, h);
+    float3 ClipSpace = float3(uv * float2(2.0, -2.0) - float2(1.0, -1.0), 0.5);
+    float4 HViewPos = mul(gSkyInvProjMat, float4(ClipSpace, 1.0));
+    float3 WorldDir = normalize(mul((float3x3)gSkyInvViewMat, HViewPos.xyz / HViewPos.w));
+
+    float earthR = Atmosphere.BottomRadius;
+    float3 camPos = camera + float3(0, earthR, 0);
+    float3 SunDir = sun_direction;
+    
+    float Slice = ((id.z + 0.5f) / AP_SLICE_COUNT);
+    Slice *= Slice; // squared distribution
+    Slice *= AP_SLICE_COUNT;
+
+    float3 WorldPos = camPos;
+
+    // Compute position from froxel information
+    float tMax = AerialPerspectiveSliceToDepth(Slice);
+    float3 newWorldPos = WorldPos + tMax * WorldDir;
+
+    // If the voxel is under the ground, make sure to offset it out on the ground.
+    float viewHeight = length(newWorldPos);
+    if (viewHeight <= (Atmosphere.BottomRadius + PLANET_RADIUS_OFFSET))
+    {
+        // Apply a position offset to make sure no artefact are visible close to the earth boundaries for large voxel.
+        newWorldPos = normalize(newWorldPos) * (Atmosphere.BottomRadius + PLANET_RADIUS_OFFSET + 0.001f);
+        WorldDir = normalize(newWorldPos - camPos);
+        tMax = length(newWorldPos - camPos);
+    }
+    float tMaxMax = tMax;
+
+    const bool ground = false;
+    const float SampleCountIni = max(1.0, float(id.z + 1.0) * 2.0f);
+    const float DepthBufferValue = -1.0;
+    const bool VariableSampleCount = false;
+    const bool MieRayPhase = true;
+    SingleScatteringResult ss = IntegrateScatteredLuminance(uv, WorldPos, WorldDir, SunDir, Atmosphere, ground,
+                                                            SampleCountIni, DepthBufferValue, VariableSampleCount,
+                                                            MieRayPhase, tMaxMax);
+
+
+    const float Transmittance = dot(ss.Transmittance, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+    _CameraVolumeLUT[id] = float4(ss.L, 1.0 - Transmittance);
+}
+
+[numthreads(8, 8, 1)]
+void IntergalSkyViewLutPS(uint3 id: SV_DispatchThreadID)
+{
+    float2 pixPos = id.xy + 0.5f;
+    AtmosphereParameters Atmosphere = GetAtmosphereParameters();
+
+    float3 WorldPos = camera + float3(0, Atmosphere.BottomRadius, 0);
+    float2 uv = pixPos / float2(192.0, 108.0);
+    float viewHeight = length(WorldPos);
+    float viewZenithCosAngle;
+    float lightViewCosAngle;
+    UvToSkyViewLutParams(Atmosphere, viewZenithCosAngle, lightViewCosAngle, viewHeight, uv);
+
+
+    float3 SunDir;
+    {
+        float3 UpVector = WorldPos / viewHeight;
+        float sunZenithCosAngle = dot(UpVector, sun_direction);
+        SunDir = normalize(float3(sqrt(1.0 - sunZenithCosAngle * sunZenithCosAngle), sunZenithCosAngle, 0.0));
+    }
+    
+    
+    WorldPos = float3(0.0f, viewHeight, 0.0f);
+    
+    float viewZenithSinAngle = sqrt(1 - viewZenithCosAngle * viewZenithCosAngle);
+    float3 WorldDir = float3(viewZenithSinAngle * lightViewCosAngle,
+                             viewZenithCosAngle,
+                             viewZenithSinAngle * sqrt(1.0 - lightViewCosAngle * lightViewCosAngle));
+
+
+    // Move to top atmospehre
+    if (!MoveToTopAtmosphere(WorldPos, WorldDir, Atmosphere.TopRadius))
+    {
+        // Ray is not intersecting the atmosphere
+        _SkyViewLUT[id.xy] = float3(0, 0, 0);
+        return;
+    }
+
+    const bool ground = false;
+    const float SampleCountIni = 30;
+    const float DepthBufferValue = -1.0;
+    const bool VariableSampleCount = true;
+    const bool MieRayPhase = true;
+    SingleScatteringResult ss = IntegrateScatteredLuminance(uv, WorldPos, WorldDir, SunDir, Atmosphere, ground,
+                                                            SampleCountIni, DepthBufferValue, VariableSampleCount,
+                                                            MieRayPhase);
+     _SkyViewLUT[id.xy] = ss.L;
+}
